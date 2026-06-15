@@ -1,0 +1,20 @@
+# Core
+numpy
+pyyaml
+pillow
+opencv-python
+
+# Stage 1 (temporal grounding + Qwen target extraction)
+torch
+salesforce-lavis            # BLIP-2 ITM
+transformers                # Qwen2.5-VL (target extraction) / CLIP
+
+# Stage 2 (spatial grounding): RSVG-ZeroOV
+# RSVG-ZeroOV is an external repo (Qwen2.5-VL + Stable Diffusion v1-4 + SAM2.1);
+# see the README weights section.
+
+# Stage 3 (mask propagation): SAM3
+# Install SAM3 from its official repo (see README weights section).
+
+# Testing
+pytest

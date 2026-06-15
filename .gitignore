@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Pipeline outputs / datasets / weights (never commit large artifacts)
+output/
+outputs/
+logs/
+*.log
+data/
+weights/
+*.pt
+*.pth
+*.npy
+*.mp4
+*.ckpt
+*.safetensors
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

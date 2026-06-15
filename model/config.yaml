@@ -1,0 +1,86 @@
+# Configuration for Zero-Shot STVG Test Pipeline
+
+# Device configuration
+device: cuda
+
+qwen2.5-vl-3b: /home/xdu/.cache/modelscope/hub/models/Qwen/Qwen2.5-VL-3B-Instruct
+qwen2.5-vl-7b: /home/xdu/.cache/modelscope/hub/models/Qwen/Qwen2.5-VL-7B-Instruct
+qwen3-vl-8b: /mnt/data/disk3/zyu/weights/qwen3-vl-8b-instruct
+
+# Stage 1: Temporal Localization (TFVTG)
+tfvtg:
+  model_name: blip2_image_text_matching
+  model_type: coco
+  batch_size: 128
+  fps: 3.0  # Sampling rate for video frames
+
+# Stage 2: Spatial Grounding (RSVG-ZeroOV)
+rsvg:
+  qwen_model: /home/xdu/.cache/modelscope/hub/models/Qwen/Qwen2.5-VL-7B-Instruct
+  sd_model: /home/xdu/.cache/modelscope/hub/models/CompVis/stable-diffusion-v1-4
+  sam_checkpoint: /home/xdu/.cache/modelscope/hub/models/facebook/sam2.1-hiera-base-plus
+  threshold: 0.4
+
+sam3:
+  # 默认大权重在 disk3；可用环境变量 SAM3_MODEL_PATH 覆盖
+  model_path: /mnt/data/disk3/zyu/weights/sam3
+  stitch_iou_threshold: 0.3
+  overlap_size: 10
+  num_segment: 1
+  trim_past_non_cond_mem_for_eval: false
+  # max_frame_num_to_track: 800
+  max_frames_for_tracker: 10000  # Maximum frames to load in start_session to avoid OOM
+  trim_past_non_cond_mem_for_eval: false
+
+# Stage 8 specific settings
+stage3_threshold: 0.001
+stage8_threshold: 0.1  # Tube selection threshold
+stage8_sam3_segment: 150  # Frames per segment for SAM3
+
+# Mistral configuration for target extraction
+mistral:
+  model_path: /home/xdu/.cache/modelscope/hub/models/LLM-Research/Mistral-7B-Instruct-v0.3
+  max_new_tokens: 50
+  temperature: 0.0
+
+sam2:
+  model_path: /home/xdu/.cache/modelscope/hub/models/facebook/sam2.1-hiera-base-plus
+  max_frames: 10000  # Maximum frames to process (SAM2 loads all frames into memory, may cause OOM for longer videos)
+  lazy_cache_size: 1000  # Lazy loading cache size (number of frames to cache in memory at once)
+  lazy_max_size: null  # Maximum image dimension for lazy loading (null = no resize, set to 1024/2048 to limit resolution)
+  chunk_size: 1500  # Chunk size for chunking strategy (number of frames per chunk)
+  chunk_overlap: 200  # Overlap size between chunks (for smooth merging)
+
+clip:
+  model_path: /home/xdu/.cache/modelscope/hub/models/openai-mirror/clip-vit-base-patch16
+
+# Stage 3: Qwen3-VL Visual Grounding (faster alternative to Stage 2)
+qwen_grounding:
+  model_path: /mnt/data/disk3/zyu/weights/qwen3-vl-8b-instruct
+  sam_checkpoint: /home/xdu/.cache/modelscope/hub/models/facebook/sam2.1-hiera-base-plus
+  max_model_len: 8192
+
+# Dataset configurations
+datasets:
+  # Input data paths
+  hcstvg_v1:
+    base_dir: /mnt/data/disk2/zyu/videoVG/data/hcstvg-v1
+    annotation_file: anno/test.json
+    video_dir: video
+    split: test
+    caption_field: caption  # Field name in annotation for text query
+    output_dir: /mnt/data/disk2/zyu/videoVG/model/output/hcstvg_v1
+  hcstvg_v2:
+    base_dir: /mnt/data/disk2/zyu/videoVG/data/hcstvg-v2
+    annotation_file: anno/val_v2.json
+    video_dir: video
+    split: val
+    caption_field: English  # Field name in annotation for text query
+    output_dir: /mnt/data/disk2/zyu/videoVG/model/output/hcstvg_v2
+  # Output paths for processed results
+  vidstg_declarative:
+    output_dir: /mnt/data/disk2/zyu/videoVG/model/output/vidstg_declarative
+  vidstg_interrogative:
+    output_dir: /mnt/data/disk2/zyu/videoVG/model/output/vidstg_interrogative
+  savg:
+    output_dir: /mnt/data/disk2/zyu/videoVG/model/output/savg

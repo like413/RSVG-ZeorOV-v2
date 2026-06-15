@@ -1,0 +1,753 @@
+"""
+SAM2 Module for video segmentation and mask propagation.
+Propagates segmentation masks across video frames with temporal consistency.
+Uses transformers library for SAM2 video prediction.
+"""
+import torch
+import numpy as np
+from typing import Dict, Optional, Tuple, List
+import logging
+import os
+from PIL import Image
+import pdb 
+logger = logging.getLogger(__name__)
+
+
+class SAM2Module:
+    """
+    Segment Anything Model 2 (SAM2) module for video segmentation.
+    Propagates segmentation masks across all video frames using video tracking.
+    Uses transformers library with SAM2VideoModel.
+    """
+    
+    def __init__(
+        self,
+        model_path: str = 'facebook/sam2.1-hiera-base-plus',
+        device: str = 'cuda'
+    ):
+        """
+        Initialize SAM2 module with video predictor from transformers.
+        
+        Args:
+            model_path: Path to SAM2 model (local path or HuggingFace model ID)
+            device: Device to run the model on ('cuda' or 'cpu')
+            
+        Raises:
+            RuntimeError: If model initialization fails
+            ValueError: If device is invalid
+        """
+        self.model_path = model_path
+        
+        # Validate device
+        if device == 'cuda' and not torch.cuda.is_available():
+            logger.warning("CUDA not available, falling back to CPU")
+            device = 'cpu'
+        
+        self.device = device
+        
+        # Initialize model and processor
+        try:
+            logger.info(f"Loading SAM2 video model from {model_path} on {device}")
+            self.model, self.processor = self._load_model()
+            logger.info("SAM2 video model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize SAM2 model: {str(e)}")
+            raise RuntimeError(f"Model initialization failed: {str(e)}") from e
+        
+        # State management
+        self.inference_session = None
+        self.video_frames = None
+        self.num_frames = 0
+        self.prompt_frame_idx = None  # Track which frame has the prompt
+    
+    def _load_model(self):
+        """
+        Load SAM2 video model and processor from transformers.
+        
+        Returns:
+            Tuple of (model, processor)
+            
+        Raises:
+            ImportError: If transformers library is not installed
+            RuntimeError: If model loading fails
+        """
+        try:
+            from transformers import Sam2VideoModel, Sam2VideoProcessor
+        except ImportError as e:
+            raise ImportError(
+                "transformers library not found. Please install it with: "
+                "pip install transformers>=4.35.0"
+            ) from e
+        
+        try:
+            # Load processor
+            processor = Sam2VideoProcessor.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                local_files_only=False
+            )
+            
+            # Load model with float32 to avoid dtype issues with CPU processing
+            model = Sam2VideoModel.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                local_files_only=False
+            ).to(self.device)
+
+            # Note: Half precision (float16) is not recommended for SAM2 as it can cause
+            # dtype mismatch issues between model weights and input data.
+            # If you need to use half precision, use torch.amp.autocast instead of model.half()
+            
+            # Set model to evaluation mode
+            model.eval()
+            
+            return model, processor
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load SAM2 model: {str(e)}") from e
+    
+    def __repr__(self) -> str:
+        """String representation of SAM2Module."""
+        return (
+            f"SAM2Module(model_path={self.model_path}, "
+            f"device={self.device})"
+        )
+
+    def initialize_video(self, video_path: str) -> int:
+        """
+        Load video frames into SAM2 and prepare for tracking.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            Total number of frames in the video
+            
+        Raises:
+            FileNotFoundError: If video file does not exist
+            RuntimeError: If video initialization fails
+        """
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        try:
+            logger.info(f"Initializing SAM2 with video: {video_path}")
+            
+            # Load video frames as PIL Images
+            self.video_frames = self._load_video_frames(video_path)
+            self.num_frames = len(self.video_frames)
+            
+            logger.info(f"Loaded {self.num_frames} frames from video")
+            
+            # Initialize inference session with video frames
+            # Use CPU for video processing to save GPU memory
+            self.inference_session = self.processor.init_video_session(
+                video=self.video_frames,
+                inference_device=self.device,
+                processing_device='cpu'  # Process video frames on CPU to save GPU memory
+            )
+            
+            logger.info("SAM2 video initialization complete")
+            return self.num_frames
+            
+        except Exception as e:
+            logger.error(f"Video initialization failed: {str(e)}")
+            raise RuntimeError(f"Video initialization failed: {str(e)}") from e
+    
+    def _load_video_frames(self, video_path: str) -> List[Image.Image]:
+        """
+        Load video frames as PIL Images for processing.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            List of PIL Image objects
+            
+        Raises:
+            RuntimeError: If video loading fails
+        """
+        try:
+            import cv2
+            
+            # Open video file
+            cap = cv2.VideoCapture(video_path)
+            
+            if not cap.isOpened():
+                raise RuntimeError(f"Failed to open video file: {video_path}")
+            
+            # Read all frames and convert to PIL Images
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert to PIL Image
+                pil_image = Image.fromarray(frame_rgb)
+                frames.append(pil_image)
+            
+            cap.release()
+            
+            if len(frames) == 0:
+                raise RuntimeError("No frames extracted from video")
+            
+            return frames
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load video frames: {str(e)}") from e
+
+    def add_prompt(self, frame_idx: int, mask: np.ndarray, use_mask_directly: bool = True) -> None:
+        """
+        Add mask prompt at key frame to initialize tracking.
+        Can use mask directly or convert to point prompts.
+        
+        Args:
+            frame_idx: Frame index where the mask is provided
+            mask: Binary mask array of shape (H, W) with values 0 or 1
+            use_mask_directly: If True, use mask directly; if False, convert to points
+            
+        Raises:
+            ValueError: If inference session is not initialized or mask is invalid
+            RuntimeError: If prompt addition fails
+        """
+        if self.inference_session is None:
+            raise ValueError(
+                "Inference session not initialized. Call initialize_video() first."
+            )
+        
+        if mask.ndim != 2:
+            raise ValueError(
+                f"Mask must be 2D array (H, W), got shape {mask.shape}"
+            )
+        
+        if frame_idx < 0 or frame_idx >= self.num_frames:
+            raise ValueError(
+                f"Frame index {frame_idx} out of range [0, {self.num_frames})"
+            )
+        
+        try:
+            logger.info(f"Adding prompt at frame {frame_idx}")
+            
+            if use_mask_directly:
+                # Use mask directly as prompt (better preserves RSVG output)
+                logger.info("Using mask directly as prompt")
+                
+                # Ensure mask is binary (0 or 1)
+                # Handle both float (0.0-1.0) and int (0-255) masks
+                if mask.dtype == np.float32 or mask.dtype == np.float64:
+                    # Float mask: threshold at 0.5
+                    binary_mask = (mask > 0.5).astype(np.uint8)
+                else:
+                    # Int mask: check if already binary (0/1) or needs thresholding (0-255)
+                    if mask.max() <= 1:
+                        # Already binary
+                        binary_mask = mask.astype(np.uint8)
+                    else:
+                        # Needs thresholding at 127
+                        binary_mask = (mask > 127).astype(np.uint8)
+                
+                # Resize mask to match video frame size if needed
+                video_height = self.inference_session.video_height
+                video_width = self.inference_session.video_width
+                
+                if binary_mask.shape != (video_height, video_width):
+                    import cv2
+                    mask_resized = cv2.resize(
+                        binary_mask,
+                        (video_width, video_height),
+                        interpolation=cv2.INTER_NEAREST
+                    )
+                else:
+                    mask_resized = binary_mask
+                
+                # Add mask to inference session
+                # Note: transformers SAM2 expects numpy array, not torch tensor
+                self.processor.add_inputs_to_inference_session(
+                    inference_session=self.inference_session,
+                    frame_idx=frame_idx,
+                    obj_ids=[1],  # Object ID list (we use 1 for single object tracking)
+                    input_masks=[mask_resized]  # List of numpy arrays
+                )
+                
+                logger.info(f"Mask prompt added - shape: {mask_resized.shape}, dtype: {mask_resized.dtype}, coverage: {np.sum(mask_resized)/mask_resized.size*100:.2f}%")
+                
+            else:
+                # Convert mask to point prompts (fallback method)
+                logger.info("Converting mask to point prompts")
+                points, labels = self._mask_to_points(mask)
+                
+                # Add points to inference session
+                input_points = [[points.tolist()]]
+                input_labels = [[labels.tolist()]]
+                
+                self.processor.add_inputs_to_inference_session(
+                    inference_session=self.inference_session,
+                    frame_idx=frame_idx,
+                    obj_ids=1,
+                    input_points=input_points,
+                    input_labels=input_labels
+                )
+                
+                logger.info(f"Point prompts added - {len(points)} points")
+            
+            # Run inference on this frame to initialize tracking
+            logger.info(f"Running inference on frame {frame_idx} to initialize tracking...")
+            
+            # Use autocast for mixed precision if model is in half precision
+            if self.device == 'cuda' and next(self.model.parameters()).dtype == torch.float16:
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    outputs = self.model(
+                        inference_session=self.inference_session,
+                        frame_idx=frame_idx
+                    )
+            else:
+                outputs = self.model(
+                    inference_session=self.inference_session,
+                    frame_idx=frame_idx
+                )
+            
+            # Record the prompt frame index for bidirectional propagation
+            self.prompt_frame_idx = frame_idx
+            
+            logger.info(f"Prompt added at frame {frame_idx} and tracking initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Prompt addition failed: {str(e)}")
+            raise RuntimeError(f"Prompt addition failed: {str(e)}") from e
+    
+    def _mask_to_points(self, mask: np.ndarray, num_points: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Convert binary mask to point prompts for SAM2.
+        Extracts multiple positive points from the mask.
+        
+        Args:
+            mask: Binary mask array of shape (H, W) with values 0 or 1
+            num_points: Number of points to extract from the mask
+            
+        Returns:
+            Tuple of (points, labels) where:
+                - points: Array of shape (N, 2) with [x, y] coordinates
+                - labels: Array of shape (N,) with all 1s (positive points)
+        """
+        # Find all positive pixels in the mask
+        y_coords, x_coords = np.where(mask > 0)
+        
+        if len(x_coords) == 0:
+            # Empty mask, return center point
+            h, w = mask.shape
+            return np.array([[w // 2, h // 2]]), np.array([1])
+        
+        # Sample points uniformly from the mask
+        num_mask_pixels = len(x_coords)
+        if num_mask_pixels <= num_points:
+            # Use all available points
+            points = np.stack([x_coords, y_coords], axis=1)
+            labels = np.ones(len(points), dtype=np.int32)
+        else:
+            # Sample uniformly
+            indices = np.linspace(0, num_mask_pixels - 1, num_points, dtype=int)
+            points = np.stack([x_coords[indices], y_coords[indices]], axis=1)
+            labels = np.ones(num_points, dtype=np.int32)
+        
+        return points, labels
+    def propagate_masks(self) -> Dict[int, np.ndarray]:
+            """
+            通过手动反转视频，实现真正的双向掩码传播。
+            
+            1. 正向传播: prompt_frame → last_frame
+            2. 反向传播: prompt_frame → first_frame (通过在反转视频上进行正向传播实现)
+            3. 合并结果
+            
+            Returns:
+                Dictionary mapping frame_idx -> mask array (H, W) with values 0 or 1
+                
+            Raises:
+                ValueError: If inference session is not initialized
+                RuntimeError: If mask propagation fails
+            """
+            if self.inference_session is None or self.video_frames is None:
+                raise ValueError(
+                    "Inference session not initialized. Call initialize_video() and add_prompt() first."
+                )
+            
+            if self.prompt_frame_idx is None:
+                raise ValueError(
+                    "Prompt not added. Call add_prompt() first."
+                )
+
+            try:
+                logger.info(f"Starting TRUE bidirectional mask propagation from frame {self.prompt_frame_idx}")
+                logger.info(f"  Total frames: {self.num_frames}")
+                
+                all_masks = {}
+                prompt_mask_at_key_frame = None
+
+                # ========================================================================
+                # Phase 1: Forward Propagation (prompt_frame → end)
+                # ========================================================================
+                logger.info(f"\n[Phase 1] Forward propagation: {self.prompt_frame_idx} → {self.num_frames-1}")
+                
+                # self.inference_session 是由 add_prompt() 初始化的
+                
+                # Use autocast for mixed precision if model is in half precision
+                use_autocast = self.device == 'cuda' and next(self.model.parameters()).dtype == torch.float16
+                
+                if use_autocast:
+                    autocast_context = torch.amp.autocast('cuda', dtype=torch.float16)
+                    autocast_context.__enter__()
+                
+                try:
+                    for sam2_video_output in self.model.propagate_in_video_iterator(self.inference_session):
+                        frame_idx = sam2_video_output.frame_idx
+                        pred_masks = sam2_video_output.pred_masks
+                        
+                        # 迭代器只会从 prompt_frame_idx 开始产出
+                        # (如果迭代器产出了所有帧, 我们也只取我们需要的)
+                        if frame_idx >= self.prompt_frame_idx: 
+                            if frame_idx % 50 == 0:
+                                logger.info(f"  Processing frame {frame_idx}/{self.num_frames}")
+                        
+                            video_res_masks = self.processor.post_process_masks(
+                                [pred_masks],
+                                original_sizes=[[self.inference_session.video_height, self.inference_session.video_width]],
+                                binarize=True
+                            )[0]
+                            
+                            if video_res_masks is not None and len(video_res_masks) > 0:
+                                binary_mask = video_res_masks[0].cpu().numpy().astype(np.uint8)
+                                all_masks[frame_idx] = binary_mask
+                                
+                                # 必须保存关键帧的 mask，用于反向传播
+                                if frame_idx == self.prompt_frame_idx:
+                                    prompt_mask_at_key_frame = binary_mask
+                finally:
+                    if use_autocast:
+                        autocast_context.__exit__(None, None, None)
+                                
+                if prompt_mask_at_key_frame is None and self.prompt_frame_idx in all_masks:
+                    prompt_mask_at_key_frame = all_masks[self.prompt_frame_idx]
+
+                if prompt_mask_at_key_frame is None:
+                    logger.error(f"  Failed to get prompt mask at frame {self.prompt_frame_idx} during forward pass.")
+                    # 尝试从 add_prompt 的原始输入中恢复 (这不应该发生)
+                    raise RuntimeError("Failed to store prompt mask from forward pass.")
+
+                logger.info(f"  Forward propagation complete: {len(all_masks)} masks collected.")
+
+
+                # ========================================================================
+                # Phase 2: Backward Propagation (prompt_frame → start)
+                # ========================================================================
+                if self.prompt_frame_idx > 0:
+                    logger.info(f"\n[Phase 2] Backward propagation: {self.prompt_frame_idx} → 0")
+                    
+                    # Clear forward session to free GPU memory before creating backward session
+                    logger.info("  Clearing forward session to free GPU memory...")
+                    if self.inference_session is not None:
+                        self.inference_session.reset_inference_session()
+                        self.inference_session = None
+                    torch.cuda.empty_cache()
+                    logger.info("  GPU memory cleared")
+                    
+                    # 1. 创建反转的视频帧列表
+                    reversed_video_frames = self.video_frames[::-1]
+                    
+                    # 2. 计算 Prompt 在反转视频中的新索引
+                    #    e.g. 964 帧 (0-963), prompt=922. 
+                    #    Reversed: (964 - 1) - 922 = 963 - 922 = 41
+                    reversed_prompt_idx = (self.num_frames - 1) - self.prompt_frame_idx
+                    
+                    logger.info(f"  Reversed video: {len(reversed_video_frames)} frames, new prompt at {reversed_prompt_idx}")
+
+                    # 3. 初始化一个新的 session 用于反向传播
+                    logger.info("  Initializing new session for backward pass...")
+                    backward_session = self.processor.init_video_session(
+                        video=reversed_video_frames,
+                        inference_device=self.device,
+                        processing_device='cpu'
+                    )
+                    
+                    # 4. 在反转视频的新索引上添加 Prompt
+                    self.processor.add_inputs_to_inference_session(
+                        inference_session=backward_session,
+                        frame_idx=reversed_prompt_idx,
+                        obj_ids=[1],
+                        input_masks=[prompt_mask_at_key_frame] # 使用第一阶段保存的 mask
+                    )
+                    
+                    # 5. 在反转的 prompt 帧上运行推理
+                    if self.device == 'cuda' and next(self.model.parameters()).dtype == torch.float16:
+                        with torch.cuda.amp.autocast(dtype=torch.float16):
+                            self.model(
+                                inference_session=backward_session,
+                                frame_idx=reversed_prompt_idx
+                            )
+                    else:
+                        self.model(
+                            inference_session=backward_session,
+                            frame_idx=reversed_prompt_idx
+                        )
+                    
+                    # 6. 在反转的视频上“前向”传播 (即原始视频的“反向”传播)
+                    num_backward_masks = 0
+                    for sam2_video_output in self.model.propagate_in_video_iterator(backward_session):
+                        reversed_idx = sam2_video_output.frame_idx
+                        
+                        # 我们只需要在反转视频中“新”的帧
+                        # (即 原始视频中 < prompt_frame_idx 的帧)
+                        if reversed_idx > reversed_prompt_idx:
+                            pred_masks = sam2_video_output.pred_masks
+                            
+                            # 7. 将索引转换回原始视频
+                            original_idx = (self.num_frames - 1) - reversed_idx
+                            
+                            if original_idx % 50 == 0:
+                                logger.info(f"  Processing reversed frame {reversed_idx} (original frame {original_idx})")
+
+                            video_res_masks = self.processor.post_process_masks(
+                                [pred_masks],
+                                original_sizes=[[backward_session.video_height, backward_session.video_width]],
+                                binarize=True
+                            )[0]
+                            
+                            if video_res_masks is not None and len(video_res_masks) > 0:
+                                binary_mask = video_res_masks[0].cpu().numpy().astype(np.uint8)
+                                all_masks[original_idx] = binary_mask
+                                num_backward_masks += 1
+                    
+                    logger.info(f"  Backward propagation complete: {num_backward_masks} masks collected.")
+                else:
+                    logger.info(f"  Skipping backward propagation (prompt at first frame)")
+                
+                # ========================================================================
+                # Phase 3: Verify and fill missing frames
+                # ========================================================================
+                logger.info(f"\n[Phase 3] Verification")
+                logger.info(f"  Total masks collected: {len(all_masks)}")
+                logger.info(f"  Expected: {self.num_frames}")
+                
+                if len(all_masks) != self.num_frames:
+                    logger.warning(f"  Missing {self.num_frames - len(all_masks)} frames, filling...")
+                    all_masks = self._fill_missing_masks(all_masks)
+                
+                logger.info(f"\n✓ Bidirectional propagation complete!")
+                return all_masks
+                
+            except Exception as e:
+                logger.error(f"Bidirectional mask propagation failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                raise RuntimeError(f"Bidirectional mask propagation failed: {str(e)}") from e
+    # def propagate_masks(self) -> Dict[int, np.ndarray]:
+    #     """
+    #     Propagate mask bidirectionally from the prompt frame to all frames.
+        
+    #     Implements true bidirectional propagation:
+    #     1. Forward propagation: prompt_frame → last_frame
+    #     2. Backward propagation: prompt_frame → first_frame
+    #     3. Merge results
+        
+    #     Returns:
+    #         Dictionary mapping frame_idx -> mask array (H, W) with values 0 or 1
+            
+    #     Raises:
+    #         ValueError: If inference session is not initialized
+    #         RuntimeError: If mask propagation fails
+    #     """
+    #     if self.inference_session is None:
+    #         raise ValueError(
+    #             "Inference session not initialized. Call initialize_video() and add_prompt() first."
+    #         )
+        
+    #     try:
+    #         logger.info(f"Starting TRUE bidirectional mask propagation from frame {self.prompt_frame_idx}")
+    #         logger.info(f"  Total frames: {self.num_frames}")
+    #         logger.info(f"  Prompt frame: {self.prompt_frame_idx}")
+            
+    #         all_masks = {}
+            
+    #         # ========================================================================
+    #         # Phase 1: Forward Propagation (prompt_frame → end)
+    #         # ========================================================================
+    #         if self.prompt_frame_idx < self.num_frames - 1:
+    #             logger.info(f"\n[Phase 1] Forward propagation: {self.prompt_frame_idx} → {self.num_frames-1}")
+                
+    #             forward_masks = {}
+    #             for sam2_video_output in self.model.propagate_in_video_iterator(self.inference_session):
+    #                 frame_idx = sam2_video_output.frame_idx
+    #                 pred_masks = sam2_video_output.pred_masks
+                    
+    #                 # Collect ALL frames (iterator goes 0 to N-1)
+    #                 # We'll use frames >= prompt_frame for forward
+    #                 if frame_idx % 50 == 0 or frame_idx == self.prompt_frame_idx:
+    #                     logger.info(f"  Processing frame {frame_idx}/{self.num_frames}")
+                    
+    #                 # Post-process masks
+    #                 video_res_masks = self.processor.post_process_masks(
+    #                     [pred_masks],
+    #                     original_sizes=[[self.inference_session.video_height, self.inference_session.video_width]],
+    #                     binarize=True
+    #                 )[0]
+                    
+    #                 if video_res_masks is not None and len(video_res_masks) > 0:
+    #                     binary_mask = video_res_masks[0].cpu().numpy().astype(np.uint8)
+    #                     # Only save frames from prompt onwards for forward pass
+    #                     if frame_idx >= self.prompt_frame_idx:
+    #                         forward_masks[frame_idx] = binary_mask
+    #                         all_masks[frame_idx] = binary_mask
+                
+    #             logger.info(f"  Forward propagation complete: {len(forward_masks)} masks (frames {self.prompt_frame_idx}-{self.num_frames-1})")
+    #         else:
+    #             logger.info(f"  Skipping forward propagation (prompt at last frame)")
+    #             forward_masks = {}
+            
+    #         # ========================================================================
+    #         # Phase 2: Backward Propagation (prompt_frame → start)
+    #         # ========================================================================
+    #         if self.prompt_frame_idx > 0:
+    #             logger.info(f"\n[Phase 2] Backward propagation: {self.prompt_frame_idx} → 0")
+                
+    #             # Reset inference session for backward propagation
+    #             logger.info("  Resetting inference session for backward pass...")
+    #             self.inference_session = self.processor.init_video_session(
+    #                 video=self.video_frames,
+    #                 inference_device=self.device,
+    #                 processing_device='cpu'
+    #             )
+                
+    #             # Re-add prompt at the same frame
+    #             logger.info(f"  Re-adding prompt at frame {self.prompt_frame_idx}...")
+    #             # Get the mask from forward propagation (or original if prompt_frame was last)
+    #             prompt_mask = all_masks.get(self.prompt_frame_idx)
+    #             if prompt_mask is None:
+    #                 logger.error("  Failed to get prompt mask for backward propagation")
+    #                 raise RuntimeError("Prompt mask not found for backward propagation")
+                
+    #             # Add prompt for backward pass
+    #             self.processor.add_inputs_to_inference_session(
+    #                 inference_session=self.inference_session,
+    #                 frame_idx=self.prompt_frame_idx,
+    #                 obj_ids=[1],
+    #                 input_masks=[prompt_mask]
+    #             )
+                
+    #             # Run inference on prompt frame
+    #             self.model(
+    #                 inference_session=self.inference_session,
+    #                 frame_idx=self.prompt_frame_idx
+    #             )
+                
+    #             # Propagate backward by collecting all frames
+    #             backward_masks = {}
+    #             for sam2_video_output in self.model.propagate_in_video_iterator(self.inference_session):
+    #                 frame_idx = sam2_video_output.frame_idx
+    #                 pred_masks = sam2_video_output.pred_masks
+                    
+    #                 if frame_idx % 50 == 0:
+    #                     logger.info(f"  Processing frame {frame_idx}/{self.num_frames}")
+                    
+    #                 # Post-process masks
+    #                 video_res_masks = self.processor.post_process_masks(
+    #                     [pred_masks],
+    #                     original_sizes=[[self.inference_session.video_height, self.inference_session.video_width]],
+    #                     binarize=True
+    #                 )[0]
+                    
+    #                 if video_res_masks is not None and len(video_res_masks) > 0:
+    #                     binary_mask = video_res_masks[0].cpu().numpy().astype(np.uint8)
+    #                     # Only save frames BEFORE prompt for backward pass
+    #                     if frame_idx < self.prompt_frame_idx:
+    #                         backward_masks[frame_idx] = binary_mask
+    #                         all_masks[frame_idx] = binary_mask
+                
+    #             logger.info(f"  Backward propagation complete: {len(backward_masks)} masks (frames 0-{self.prompt_frame_idx-1})")
+    #         else:
+    #             logger.info(f"  Skipping backward propagation (prompt at first frame)")
+            
+    #         # ========================================================================
+    #         # Phase 3: Verify and fill missing frames
+    #         # ========================================================================
+    #         logger.info(f"\n[Phase 3] Verification")
+    #         logger.info(f"  Total masks collected: {len(all_masks)}")
+    #         logger.info(f"  Expected: {self.num_frames}")
+            
+    #         if len(all_masks) != self.num_frames:
+    #             logger.warning(f"  Missing {self.num_frames - len(all_masks)} frames, filling...")
+    #             all_masks = self._fill_missing_masks(all_masks)
+            
+    #         logger.info(f"\n✓ Bidirectional propagation complete!")
+    #         logger.info(f"  Frames 0-{self.prompt_frame_idx-1}: Backward propagation")
+    #         logger.info(f"  Frame {self.prompt_frame_idx}: Prompt frame")
+    #         logger.info(f"  Frames {self.prompt_frame_idx+1}-{self.num_frames-1}: Forward propagation")
+    #         # pdb.set_trace()
+    #         return all_masks
+            
+    #     except Exception as e:
+    #         logger.error(f"Bidirectional mask propagation failed: {str(e)}")
+    #         import traceback
+    #         traceback.print_exc()
+    #         raise RuntimeError(f"Bidirectional mask propagation failed: {str(e)}") from e
+    
+    def _fill_missing_masks(self, masks: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+        """
+        Fill missing frame indices with empty masks.
+        
+        Args:
+            masks: Dictionary of existing masks
+            
+        Returns:
+            Complete dictionary with all frame indices
+        """
+        if not masks:
+            # No masks at all, create empty masks for all frames
+            return {i: np.zeros((480, 640), dtype=np.uint8) for i in range(self.num_frames)}
+        
+        # Get mask shape from existing masks
+        sample_mask = next(iter(masks.values()))
+        mask_shape = sample_mask.shape
+        
+        # Fill missing frames
+        complete_masks = {}
+        for frame_idx in range(self.num_frames):
+            if frame_idx in masks:
+                complete_masks[frame_idx] = masks[frame_idx]
+            else:
+                logger.debug(f"Creating empty mask for missing frame {frame_idx}")
+                complete_masks[frame_idx] = np.zeros(mask_shape, dtype=np.uint8)
+        
+        return complete_masks
+
+    def reset(self) -> None:
+        """
+        Clear video state and release memory for next video.
+        
+        Resets the inference session and clears cached data to prepare
+        for processing a new video.
+        """
+        logger.info("Resetting SAM2 state")
+        
+        # Reset inference session if it exists
+        if self.inference_session is not None:
+            self.inference_session.reset_inference_session()
+        
+        # Clear state
+        self.inference_session = None
+        self.video_frames = None
+        self.num_frames = 0
+        
+        # Clear GPU cache if using CUDA
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+            logger.debug("Cleared GPU cache")
+        
+        logger.info("SAM2 state reset complete")
+    
+    def cleanup(self):
+        """
+        Release GPU memory and cleanup resources.
+        
+        This is an alias for reset() to maintain consistency with other modules.
+        """
+        self.reset()
