@@ -1,7 +1,7 @@
 # Training-Free Open-Vocabulary Visual Grounding for Remote Sensing Images and Videos
 
 This repository is the official implementation:
-> [Training-Free Open-Vocabulary Visual Grounding for Remote Sensing Images and Videos](https://arxiv.org)  
+> [Training-Free Open-Vocabulary Visual Grounding for Remote Sensing Images and Videos](https://arxiv.org/abs/2606.16124)  
 > Ke Li, Di Wang, Yongshan Zhu, Ting Wang, Weiping Ni, Tao Lei, Quan Wang, Xinbo Gao
 
 ## Abstract
