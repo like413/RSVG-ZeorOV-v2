@@ -18,7 +18,7 @@ To handle video inputs, we further present Video RSVG-ZeroOV, which extends imag
 Extensive experiments on six image and video grounding benchmarks show that RSVG-ZeroOV consistently outperforms existing zero-shot baselines and achieves competitive or superior performance compared with weakly- and fully-supervised methods.
 
 <div align="center">
-  <img src="https://github.com/like413/RSVG-ZeorOV-v2/blob/main/framework_video.pdf" width="100%" height="100%"/>
+  <img src="https://github.com/like413/RSVG-ZeorOV-v2/blob/main/framework_video.png" width="100%" height="100%"/>
   The framework of the proposed Video RSVG-ZeroOV.
 </div><br/>
 
