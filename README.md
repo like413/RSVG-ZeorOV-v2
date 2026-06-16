@@ -1,14 +1,26 @@
-# RSVG-ZeroOV-v2 — Zero-Shot Spatio-Temporal Video Grounding
+# Training-Free Open-Vocabulary Visual Grounding for Remote Sensing Images and Videos
 
-A **training-free**, **zero-shot** pipeline for Spatio-Temporal Video Grounding (STVG)
-on **UAV-SAVG**. Given a video and a natural-language query
-(e.g. *"the black all-terrain vehicle at the front of the curve"*), it localizes
-the target **in time** (key frame) and **in space** (a per-frame segmentation
-mask tube).
+This repository is the official implementation:
+> [Training-Free Open-Vocabulary Visual Grounding for Remote Sensing Images and Videos](https://arxiv.org)  
+> Ke Li, Di Wang, Yongshan Zhu, Ting Wang, Weiping Ni, Tao Lei, Quan Wang, Xinbo Gao
 
-The refactored, high-cohesion / low-coupling implementation lives in
-[`model/stvg/`](model/stvg). Full documentation — architecture diagram, weights
-layout, and stage I/O reference — is in **[`model/README.md`](model/README.md)**.
+## Abstract
+Remote sensing visual grounding (RSVG) aims to localize a referred target in a remote sensing image or video according to a natural language expression.
+Existing RSVG methods usually rely on task-specific manual annotations, which are costly to collect and inevitably limited in covering the diversity of real-world geospatial scenarios. 
+As a result, they often struggle to generalize to open-vocabulary queries involving novel objects, fine-grained attributes, complex spatial relationships, and functional semantics.
+In this paper, we propose RSVG-ZeroOV, a training-free framework that leverages frozen generic foundation models for zero-shot open-vocabulary RSVG.
+RSVG-ZeroOV follows an *Overview-Focus-Evolve* paradigm, which exploits the distinct yet complementary attention patterns of vision-language models (VLMs) and diffusion models (DMs) to progressively generate precise grounding results.
+Specifically, 
+*(i) Overview* utilizes a VLM to extract cross-attention maps that capture semantic correlations between the referring expression and visual regions; 
+*(ii) Focus* leverages the fine-grained modeling priors of a DM to compensate for object structure and shape information often overlooked by VLM attention; 
+and *(iii) Evolve* introduces a simple yet effective attention evolution module to suppress irrelevant activations, yielding purified object masks.
+To handle video inputs, we further present Video RSVG-ZeroOV, which extends image-level grounding to spatio-temporal grounding through a query-relevant key-frame selector and a temporal propagator, enabling efficient and temporally coherent video grounding without video annotations or fine-tuning.
+Extensive experiments on six image and video grounding benchmarks show that RSVG-ZeroOV consistently outperforms existing zero-shot baselines and achieves competitive or superior performance compared with weakly- and fully-supervised methods.
+
+<div align="center">
+  <img src="https://github.com/like413/RSVG-ZeorOV-v2/blob/main/framework_video.pdf" width="100%" height="100%"/>
+  The framework of the proposed Video RSVG-ZeroOV.
+</div><br/>
 
 ## Pipeline at a glance
 
